@@ -1,7 +1,8 @@
 import functools
+import io
 import logging
 import pathlib
-from typing import List, Optional
+from typing import List, Optional, Union
 
 import pandas as pd
 import plotly.express as px
@@ -11,11 +12,20 @@ from sklearn.linear_model import Lasso, LinearRegression
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from sklearn.model_selection import train_test_split
 from sklearn.svm import SVR
-from sklearn.tree import DecisionTreeClassifier
 
+
+# typ pro Streamlit kontejnery
+StContainer = st.delta_generator.DeltaGenerator
+
+
+# adresář s daty
 DATA_DIR = pathlib.Path("data")
 
 
+# slovník s názvy modelů pro regresi
+# u každého modelu je třeba definovat class - třídu, která se použije
+# a hyperparams, který obsahuje slovník názvů hyperparametrů a funkcí pro vytvoření streamlit widgetu
+# předpokládá se, že třídy mají scikit-learn API
 REGRESSION_MODELS = {
     "LinearRegression": {
         "class": LinearRegression,
@@ -37,20 +47,13 @@ REGRESSION_MODELS = {
 }
 
 
-CLASSIFIERS = {
-    "DecisionTreeClassifier": {
-        "class": DecisionTreeClassifier,
-        "hyperparams": {},
-    },
-}
-
-
+# názvy metrik a příslušné funkce pro výpočet
 METRICS = {"MAE": mean_absolute_error, "MSE": mean_squared_error, "R2": r2_score}
 
 
 @st.cache
-def load_data() -> pd.DataFrame:
-    return pd.read_csv(DATA_DIR.joinpath("fish_data.csv"), index_col=0)
+def load_data(csv_file: Union[str, pathlib.Path, io.IOBase]) -> pd.DataFrame:
+    return pd.read_csv(csv_file, index_col=0)
 
 
 @st.cache
@@ -64,31 +67,55 @@ def preprocess(
     return data
 
 
-def regression(col1, col2, fish_data, target, X, X_train, X_test, y_train, y_test):
-    expander = col1.beta_expander("Výběr modelu")
-    with expander:
+def regression(
+    col1: StContainer,
+    col2: StContainer,
+    learning_data: pd.DataFrame,
+    target: str,
+    test_size: float,
+    stratify: str,
+) -> None:
+    """Regrese v dashboardu"""
+
+    # rozdělení na trénovací a testovací data
+    y = learning_data[target]
+    X = learning_data.drop(columns=[target])
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=test_size, stratify=stratify)
+
+    with col1.beta_expander("Výběr modelu"):
         model = st.selectbox("Regresní model", list(REGRESSION_MODELS))
+        # hodnoty hyperparametrů si uložíme do slovníku typu {jméno hyperparametru: hodnota}
         hyperparams = {
             hyperparam: widget() for hyperparam, widget in REGRESSION_MODELS[model]["hyperparams"].items()
         }
         metric = st.selectbox("Metrika", list(METRICS))
 
+    # REGRESSION_MODELS[model]["class"] vrací třídu regresoru, např. LinearRegression
+    # ve slovníku hyperparams máme uložené hodnoty hyperparametrů od uživatele
+    # takto tedy můžeme vytvořit příslušný regresor
     regressor = REGRESSION_MODELS[model]["class"](**hyperparams)
+    # zkusíme natrénovat model
     try:
         regressor.fit(X_train, y_train)
-    except Exception as error:
-        st.error(f"Chyba při fitování modelu: {error}")
+    except Exception as prediction_error:
+        # v případě chyby ukážeme uživateli co se stalo
+        st.error(f"Chyba při fitování modelu: {prediction_error}")
+        # a nebudeme už nic dalšího zobrazovat
         return
+
+    # predikce pomocí natrénovaného modelu
     y_predicted = regressor.predict(X_test)
-    error = METRICS[metric](y_predicted, y_test)
+    prediction_error = METRICS[metric](y_predicted, y_test)
 
-    col2.header("Výsledky modelu")
-    col2.write(f"{metric}: {error:.3g}")
+    col2.header(f"Výsledek modelu {model}")
+    col2.write(f"{metric}: {prediction_error:.3g}")
 
-    predicted_target = f"{target} - predicted"
-    # X = pd.concat((X_train, X_test), axis=0)
-    complete_data = fish_data.assign(**{predicted_target: regressor.predict(X)})
-    fig = px.scatter(complete_data, x=target, y=predicted_target, color="Species")
+    # vytvoříme pomocný dataframe s se sloupcem s predikcí
+    predicted_target_column = f"{target} - predicted"
+    complete_data = learning_data.assign(**{predicted_target_column: regressor.predict(X)})
+    # vykreslíme správné vs predikované body
+    fig = px.scatter(complete_data, x=target, y=predicted_target_column)
+    # přidáme čáru ukazující ideální predikci
     fig.add_trace(
         go.Scatter(
             x=[complete_data[target].min(), complete_data[target].max()],
@@ -101,44 +128,57 @@ def regression(col1, col2, fish_data, target, X, X_train, X_test, y_train, y_tes
     col2.write(fig)
 
 
-def classification(col1, col2, fish_data, target, X, X_train, X_test, y_train, y_test):
+def classification(
+    col1: StContainer,
+    col2: StContainer,
+    learning_data: pd.DataFrame,
+    target: str,
+    test_size: float,
+    stratify: str,
+) -> None:
     st.error("Tohle ještě chybí")
 
 
-def main():
+def main() -> None:
+    # základní vlastnosti aplikace: jméno, široké rozložení
     st.set_page_config(page_title="Fishboard", layout="wide")
     st.title("Fishboard")
+
+    # použijeme dva sloupce
     col1, col2 = st.beta_columns(2)
 
-    col1.header("Načtení dat")
-    fish_data = load_data()
+    with col1.beta_expander("Výběr dat"):
+        # TODO použí file upload for načtení uživatelských dat
+        st.write("Vstupní data jsou ze souboru fish_data.csv")
+    source_data = load_data(DATA_DIR / "fish_data.csv")
+
     with col1.beta_expander("Preprocessing"):
-        drop_columns = st.multiselect("Drop columns", fish_data.columns)
+        drop_columns = st.multiselect("Drop columns", source_data.columns)
         get_dummies = st.checkbox("Get dummies")
-    learning_data = preprocess(fish_data, drop_columns, get_dummies)
+    learning_data = preprocess(source_data, drop_columns, get_dummies)
 
     with col1.beta_expander("Zobrazení dat"):
-        st.dataframe(learning_data, height=150)
-        fig = px.scatter_matrix(learning_data)
-        st.write(fig)
+        display_preprocessed = st.checkbox("Zobrazit preprocesovaná data", value=False)
+        if display_preprocessed:
+            displayed_data = learning_data
+            # st.dataframe(displayed_data)
+        else:
+            displayed_data = source_data
+            # st.dataframe(displayed_data)
+        # TODO přidat grafy
+        st.dataframe(displayed_data)
 
     target = col1.selectbox("Sloupec s odezvou", learning_data.columns)
-    y = learning_data[target]
-    X = learning_data.drop(columns=[target])
 
-    # col1.header("Rozdělení na testovací a trénovací data")
-    expander = col1.beta_expander("Rozdělení na testovací a trénovací data")
-    with expander:
+    with col1.beta_expander("Rozdělení na testovací a trénovací data"):
         test_size = st.slider("Poměr testovací sady", 0.0, 1.0, 0.25, 0.05)
-        stratify_column = st.selectbox("Stratify", [None] + list(fish_data.columns))
+        stratify_column = st.selectbox("Stratify", [None] + list(source_data.columns))
     if stratify_column is not None:
-        stratify = fish_data[stratify_column]
+        stratify = source_data[stratify_column]
     else:
         stratify = None
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=test_size, stratify=stratify)
-    regression(col1, col2, fish_data, target, X, X_train, X_test, y_train, y_test)
 
-
+    regression(col1, col2, learning_data, target, test_size, stratify)
 
 
 if __name__ == "__main__":
